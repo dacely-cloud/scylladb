@@ -1088,8 +1088,8 @@ void compaction_manager::register_metrics() {
                        sm::description("Holds the number of tables with postponed compaction.")),
         sm::make_gauge("regular_compaction_task_backlog", [this] { return _tasks.size(); },
                        sm::description("Holds the number of regular compaction task objects currently retained by the compaction manager.")),
-        sm::make_gauge("regular_compaction_task_backlog_limit", [] { return regular_compaction_task_backlog_limit(); },
-                       sm::description("Maximum number of regular compaction task objects retained before additional submissions are postponed.")),
+        sm::make_gauge("regular_compaction_task_backlog_limit", [this] { return _startup_regular_compaction_backlog_limit_enabled ? regular_compaction_task_backlog_limit() : 0; },
+                       sm::description("Startup-only maximum number of regular compaction task objects retained before additional submissions are postponed. Reports 0 after the startup limiter is disabled.")),
         sm::make_gauge("backlog", [this] { return _last_backlog; },
                        sm::description("Holds the sum of compaction backlog for all tables in the system.")),
         sm::make_gauge("normalized_backlog", [this] { return _last_backlog / available_memory(); },
@@ -1163,6 +1163,14 @@ future<> compaction_manager::postponed_compactions_reevaluation() {
 
 void compaction_manager::reevaluate_postponed_compactions() noexcept {
     _postponed_reevaluation.signal();
+}
+
+void compaction_manager::disable_startup_regular_compaction_backlog_limit() noexcept {
+    if (!_startup_regular_compaction_backlog_limit_enabled) {
+        return;
+    }
+    _startup_regular_compaction_backlog_limit_enabled = false;
+    reevaluate_postponed_compactions();
 }
 
 future<> compaction_manager::stop_postponed_compactions() noexcept {

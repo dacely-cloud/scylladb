@@ -15,6 +15,17 @@ The stale keyspaces were the trigger. The bug was not row cache pressure. Boot
 could enqueue too much schema, compaction, and audit preprocessing work before
 CQL was available.
 
+Representative journal snippets from the failing node:
+
+```text
+Jun 21 02:04:33 node scylla[157948]: INFO  2026-06-21 02:04:33,062 [shard 0:main] init - loading non-system sstables
+Jun 21 02:28:48 node scylla[157948]: 1        1        16K        system_schema.tables/data-query/active/need_cpu
+Jun 21 02:28:48 node scylla[157948]: reads_queued_because_need_cpu_permits: 27267
+Jun 21 04:58:04 node scylla[380858]: WARN  2026-06-21 04:58:04,700 [shard 0:main] seastar - Too long queue accumulated for main (8777 tasks)
+Jun 21 04:58:20 node scylla[380858]: WARN  2026-06-21 04:58:20,734 [shard 0:main] seastar - (rate limiting dropped 21609 similar messages) Too long queue accumulated for main (26501 tasks)
+Jun 21 04:58:30 node scylla[380858]: WARN  2026-06-21 04:58:30,735 [shard 0:comp] seastar - (rate limiting dropped 14523 similar messages) Too long queue accumulated for compaction (18728 tasks)
+```
+
 ## Root Cause
 
 Startup blocks before CQL registration in:
@@ -54,21 +65,29 @@ set when it only needs to know whether at least one mapping exists.
 
 ### Regular Compaction Submission Backlog
 
-`compaction_manager::submit()` now has a hard retained-task cap for regular
-compaction submissions:
+`compaction_manager::submit()` now has a startup-only retained-task cap for
+regular compaction submissions:
 
 - `regular_compaction_task_backlog_limit()`
 - `regular_compaction_task_backlog_full()`
 
-When the cap is hit, more regular submissions are postponed instead of
+When the startup cap is hit, more regular submissions are postponed instead of
 allocating more task objects. Task completion signals reevaluation, and
 postponed work drains only while the cap has room.
+
+The limiter is disabled before Scylla announces serving, via
+`disable_startup_regular_compaction_backlog_limit()`. Once disabled, normal
+runtime compaction scheduling is not capped by this startup guard. Any postponed
+startup work is reevaluated when the guard is disabled.
 
 Metrics:
 
 - `scylla_compaction_manager_regular_compaction_task_backlog`
 - `scylla_compaction_manager_regular_compaction_task_backlog_limit`
 - `scylla_compaction_manager_postponed_compactions`
+
+The backlog limit metric reports `0` after startup to show that the startup
+guard is no longer active.
 
 ### Audit Known-Table Cache
 
@@ -87,8 +106,9 @@ startup optimization cache is skipped.
 - `test_preprocessed_large_known_table_set_uses_bounded_lazy_path`
 
 These verify that schema helpers throttle without dropping work, compaction
-submission cannot retain more task objects than the cap, and audit matching
-still works when the eager known-table cache is skipped.
+submission cannot retain more task objects than the cap during startup,
+compaction submission can exceed the cap once the startup guard is disabled,
+and audit matching still works when the eager known-table cache is skipped.
 
 ## Validation Performed
 
@@ -109,14 +129,85 @@ complete proof for the original 8k+ logical-table reproducer because the copied
 workdir's system schema loaded zero non-system keyspaces, even though stale data
 directories were present on disk.
 
-## Validation Still Required
+Final logical-schema validation used a repo-mounted workdir so data persisted
+across `dbuild` container invocations:
 
-Reproduce with a real logical schema containing a large number of one-table
-keyspaces and a full `scylla` server binary, then confirm:
+```console
+time cqlsh 127.0.0.1 19142 --connect-timeout=30 --request-timeout=120 -f /tmp/scylla-highcard-schema.cql
+```
 
-- CQL starts successfully
-- `scylla_database_queued_reads{class="system"}` remains bounded
-- compaction task backlog stays at or below
-  `scylla_compaction_manager_regular_compaction_task_backlog_limit`
-- audit startup either loads a bounded known-table cache or explicitly skips
-  eager audit known-table caching above the cap
+That created 4,200 real one-table keyspaces in 5m31s:
+
+```text
+ count
+-------
+  4200
+
+ count
+-------
+  4200
+
+ keyspace_name
+---------------
+       hc_4199
+
+ table_name
+------------
+          t
+```
+
+The final restart from the same mounted workdir completed successfully:
+
+```text
+INFO  2026-06-21 06:40:32,536 [shard 0:main] database - Loading schema table keyspaces for 4205 keyspaces with concurrency 1
+INFO  2026-06-21 06:40:32,817 [shard 0:main] database - Loading schema table tables for 4204 keyspaces with concurrency 1
+INFO  2026-06-21 06:40:40,868 [shard 0:main] database - Populating 1 priority non-system keyspaces with concurrency 2
+INFO  2026-06-21 06:40:40,870 [shard 0:main] database - Populating 4204 non-system keyspaces with concurrency 2
+INFO  2026-06-21 06:40:43,288 [shard 0:main] group0_raft_sm - Skipping eager audit known-table cache for 4286 tables; cap is 4096; matching remains exact via per-request rule evaluation
+INFO  2026-06-21 06:40:43,472 [shard 0:main] init - serving
+INFO  2026-06-21 06:40:43,472 [shard 0:main] init - Scylla version 2026.3.0~dev-0.20260621.048d9b50079c initialization completed.
+```
+
+Post-boot CQL confirmed the logical schema was present:
+
+```text
+ count
+-------
+  4200
+
+ count
+-------
+  4200
+
+ keyspace_name
+---------------
+       hc_4199
+
+ table_name
+------------
+          t
+```
+
+Post-boot metrics:
+
+```text
+scylla_compaction_manager_postponed_compactions{shard="0"} 0.000000
+scylla_compaction_manager_regular_compaction_task_backlog{shard="0"} 0.000000
+scylla_compaction_manager_regular_compaction_task_backlog_limit{shard="0"} 0.000000
+scylla_database_queued_reads{class="system",shard="0"} 0.000000
+scylla_database_reads_memory_consumption{class="system",shard="0"} 0.000000
+scylla_memory_malloc_failed{shard="0"} 0
+```
+
+The restart log had no `ERROR`, `FATAL`, `bad_alloc`, `std::bad_alloc`,
+`Aborting`, or `malloc_failed` lines. Non-fatal dev-environment warnings were
+still present, including sysctl and I/O scheduler warnings, single-node gossip
+warnings, and two oversized allocation warnings of 135,168 and 270,336 bytes.
+
+## Validation Status
+
+The high-cardinality logical-schema restart case is reproduced and closed for a
+single-shard 4 GiB dev node with 4,200 real one-table keyspaces. Broader
+multi-shard and production-hardware validation is still useful, but the original
+startup fanout failure mode is covered by tests and by the full local restart
+run above.

@@ -247,6 +247,16 @@ SEASTAR_TEST_CASE(regular_compaction_submission_backlog_is_bounded_test) {
         BOOST_REQUIRE_EQUAL(cm.live_compaction_tasks_for_tests(), limit);
         BOOST_REQUIRE_GE(cm.postponed_compactions_for_tests(), 64);
 
+        BOOST_REQUIRE(cm.startup_regular_compaction_backlog_limit_enabled_for_tests());
+        cm.disable_startup_regular_compaction_backlog_limit();
+        deadline = lowres_clock::now() + 5s;
+        while (cm.live_compaction_tasks_for_tests() <= limit && lowres_clock::now() < deadline) {
+            sleep(10ms).get();
+        }
+
+        BOOST_REQUIRE(!cm.startup_regular_compaction_backlog_limit_enabled_for_tests());
+        BOOST_REQUIRE_GT(cm.live_compaction_tasks_for_tests(), limit);
+
         disable_injection.cancel();
         utils::get_local_injector().disable(pause_injection);
 
