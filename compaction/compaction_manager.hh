@@ -153,6 +153,8 @@ private:
     // all registered tables are reevaluated at a constant interval.
     // Submission is a NO-OP when there's nothing to do, so it's fine to call it regularly.
     static constexpr std::chrono::seconds periodic_compaction_submission_interval() { return std::chrono::seconds(3600); }
+    static constexpr size_t regular_compaction_task_backlog_limit() { return 256; }
+    bool regular_compaction_task_backlog_full() const { return _tasks.size() >= regular_compaction_task_backlog_limit(); }
 
     config _cfg;
     timer<lowres_clock> _compaction_submission_timer;
@@ -428,6 +430,16 @@ public:
 
     const stats& get_stats() const {
         return _stats;
+    }
+
+    static constexpr size_t max_regular_compaction_task_backlog_for_tests() {
+        return regular_compaction_task_backlog_limit();
+    }
+    size_t live_compaction_tasks_for_tests() const {
+        return _tasks.size();
+    }
+    size_t postponed_compactions_for_tests() const {
+        return _postponed.size();
     }
 
     const std::vector<compaction_info> get_compactions(std::function<bool(const compaction_group_view*)> filter = [] (auto) { return true; }) const;
